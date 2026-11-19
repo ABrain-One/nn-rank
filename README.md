@@ -379,17 +379,22 @@ If you find the NN-Rank project to be useful for your research, please consider 
 
 ```bibtex
 
-@misc{ABrain.Rank,
+@article{ABrain.Rank,
     author = {Ignatov, Dmitry},
 	title = {A Frontier-Based Theory of Quality--Resource Trade-offs for {AI} Model Selection},
-	year = {2026},
-	howpublished = {Preprint, SSRN},
-	note = {DOI:\href{https://doi.org/10.2139/ssrn.7683960}{10.2139/ssrn.7683960}. Software: \url{https://github.com/ABrain-One/nn-rank}}
+	journal = {SSRN},
+	volume  = {7683960},
+	url = {https://doi.org/10.2139/ssrn.7683960},
+	year={2026}	
+	note = {Software: \url{https://github.com/ABrain-One/nn-rank}}
 }
 
-@misc{ABrain.Multi-Rank,
+@article{ABrain.Multi-Rank,
     author = {Ignatov, Dmitry},
 	title = {A Differential Theory of Quality–Resource Trade-offs for {AI} Model Selection: The Multiresource Frontier and Its Minimax Price},
+	journal = {arXiv preprint},
+	volume  = {arXiv:2611.23324},
+	url = {https://arxiv.org/abs/2611.23324},
 	year = {2026},	
 	note = {Software: \url{https://github.com/ABrain-One/nn-rank}}
 }
