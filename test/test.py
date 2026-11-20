@@ -882,7 +882,7 @@ class TestKneeRegret(unittest.TestCase):
         identity sigma* - sigma = shortfall + displacement must hold exactly"""
         f = r["fit"]
         x = np.log(k["resource"].to_numpy(float))
-        raw = f["eps_inf"] + f["c"] * np.exp(-f["alpha"] * (x - f["x0"]))
+        raw = f["eps_inf"] + f["c"] * np.exp(-f["alpha"] * x)
         return k[raw <= 1.0]
 
     def test_the_split_is_an_identity(self):
@@ -925,8 +925,7 @@ class TestKneeRegret(unittest.TestCase):
                 k = self._fin(r)
                 f = r["fit"]
                 x = np.log(k["resource"].to_numpy(float))
-                raw = f["eps_inf"] + f["c"] * np.exp(-f["alpha"]
-                                                     * (x - f["x0"]))
+                raw = f["eps_inf"] + f["c"] * np.exp(-f["alpha"] * x)
                 free = k[raw <= 1.0]
                 if len(free) < 1:
                     continue
@@ -954,15 +953,42 @@ class TestKneeRegret(unittest.TestCase):
             self.skipTest("this frontier is not priced at alpha/2")
         k = self._fin(r)
         x = np.log(k["resource"].to_numpy(float))
-        xs = f["x0"] + math.log(f["c"] / f["eps_inf"]) / f["alpha"]
+        xs = math.log(f["c"] / f["eps_inf"]) / f["alpha"]
         want = np.log(np.cosh(f["alpha"] * (x - xs) / 2))
         self.assertTrue(np.allclose(k["displacement_nats"].to_numpy(float),
                                     want, atol=1e-9))
 
+    def test_the_curve_agrees_with_the_programs_own_knee(self):
+        # eps = eps_inf + c t^-alpha is in the resource's OWN units: the law
+        # has no origin of its own, and reading it with one silently rescales
+        # c by t_0^alpha.  The program already publishes the knee, where
+        # eps = 2 eps_inf by definition, so the curve is pinned against it.
+        for K in (6, 9, 12):
+            for kw in (dict(floor=0.05, c=0.9, alpha=0.8),
+                       dict(floor=0.02, c=1.5, alpha=0.6),
+                       dict(floor=0.15, c=0.8, alpha=1.0)):
+                with self.subTest(K=K, **kw):
+                    r = select(frontier(K, **kw), rank=True, boot=0)
+                    f = r["fit"]
+                    if not f or not f.get("knee") or not f.get("eps_inf"):
+                        continue
+                    at_knee = float(frontier_at(f, np.log(f["knee"])))
+                    self.assertAlmostEqual(at_knee, 2 * f["eps_inf"], places=9)
+
+    def test_the_curve_passes_through_the_measured_front(self):
+        # and it must actually track the data: a misread origin shows up at
+        # once as a curve far from the points it was fitted on
+        r = select(frontier(12, noise=0.0), rank=True, boot=0)
+        k = r["ranking"]
+        x = np.log(k["resource"].to_numpy(float))
+        pred = frontier_at(r["fit"], x)
+        self.assertLess(float(np.max(np.abs(
+            (1 - k["accuracy"].to_numpy(float)) - pred))), 0.02)
+
     def test_the_curve_may_not_promise_worse_than_the_trivial_bound(self):
         r = select(frontier(12), rank=True, boot=0)
         f = r["fit"]
-        far = np.array([f["x0"] - 50.0, f["x0"] - 200.0, f["x0"]])
+        far = np.array([-50.0, -200.0, 0.0])
         self.assertTrue(np.all(frontier_at(f, far) <= 1.0 + 1e-15))
         self.assertTrue(np.all(np.isfinite(frontier_at(f, far))))
 

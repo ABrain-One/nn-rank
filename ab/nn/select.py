@@ -612,14 +612,15 @@ def frontier_at(fit, x):
     evaluated."""
     if not fit:
         return None
-    e_inf, c, al, x0 = (fit.get("eps_inf"), fit.get("c"), fit.get("alpha"),
-                        fit.get("x0"))
-    if e_inf is None or c is None or al is None or x0 is None:
+    e_inf, c, al = fit.get("eps_inf"), fit.get("c"), fit.get("alpha")
+    if e_inf is None or c is None or al is None:
         return None
     if not (c > 0 and al > 0):
         return None
+    # the law is eps = eps_inf + c t^-alpha in the resource's own units, so
+    # x enters as ln t with no origin of its own
     with np.errstate(over="ignore"):
-        eps = e_inf + c * np.exp(-al * (np.asarray(x, float) - x0))
+        eps = e_inf + c * np.exp(-al * np.asarray(x, float))
     return np.minimum(eps, 1.0)
 
 
@@ -666,9 +667,8 @@ def knee_regret(df, axis, fit, lam):
     nan = np.full(n, np.nan)
     if not fit or (axis not in df and "x__" + axis not in df):
         return nan, nan, nan
-    al, x0, c, e_inf = (fit.get("alpha"), fit.get("x0"), fit.get("c"),
-                        fit.get("eps_inf"))
-    if al is None or x0 is None or c is None or not e_inf or e_inf <= 0:
+    al, c, e_inf = fit.get("alpha"), fit.get("c"), fit.get("eps_inf")
+    if al is None or c is None or not e_inf or e_inf <= 0:
         return nan, nan, nan
     if not (c > 0 and al > 0) or lam is None:
         return nan, nan, nan
@@ -685,7 +685,7 @@ def knee_regret(df, axis, fit, lam):
         return nan, nan, nan
     with np.errstate(divide="ignore", invalid="ignore"):
         short = np.log(eps / eps_f)
-    x_star = x0 + math.log(c / e_inf) / al              # eps_f(x*) = 2 eps_inf
+    x_star = math.log(c / e_inf) / al                  # eps_f(x*) = 2 eps_inf
     v = al * (x - x_star)
     # p = 1/(1+e^v) and 1-p = 1/(1+e^-v), written through logaddexp so that
     # neither tail underflows: KL(beta||p) = -H(beta) - b ln p - (1-b) ln(1-p)
@@ -977,7 +977,6 @@ def axis_price(df, axis, alpha=0.05, boot=400, seed=0, p_floor=0.05,
                aicc_delta=(None if (A_s is None or A_p is None)
                            else A_p - A_s),
                resolved_nats=float(-ls.min()),
-               x0=float(xs.min()),
                range=[float(t.min()), float(t.max())])
 
     if pval is None:
@@ -1399,7 +1398,6 @@ def select(df, alpha=0.05, boot=400, seed=0, aicc_k="with-variance",
                       "aicc_convention": aicc_k, "knee": p0["knee"],
                       "knee_spanned": p0["knee_spanned"],
                       "resolved_nats": p0.get("resolved_nats"),
-                      "x0": p0.get("x0"),
                       "range": p0.get("range")}
 
     lam = {a: priced[a]["lambda"] for a in priced}
