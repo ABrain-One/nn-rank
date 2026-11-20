@@ -100,7 +100,7 @@ value as it is.
 |---|---|
 | `winner["name"]` | **the selected model** |
 | `winner["score"]` | **its score** — higher is better |
-| `ranking` | a `DataFrame`, winner first: `name`, `score`, `rank`, `accuracy`, each resource, `sigma`, `eps_eff`, `margin_to_next`, `rank_low`, `rank_high`, `optimal_from`, `optimal_to`, `regret_sup`, `in_band`, `note` |
+| `ranking` | a `DataFrame`, winner first: `name`, `score`, `rank`, `accuracy`, each resource, `sigma`, `eps_eff`, `margin_to_next`, `rank_low`, `rank_high`, `optimal_from`, `optimal_to`, `regret_sup`, `in_band`, `shortfall_nats`, `displacement_nats`, `regret_nats`, `note` |
 | `band` | the candidates a supported price can select, and the price range that supports them |
 | `minimax` | the pick, its worst-case regret in nats, and what a single price would have picked |
 
@@ -164,6 +164,55 @@ cannot use.
 No verdict is returned, and that is not an omission: a price you supplied is
 not a measurement this data can confirm or reject. Read the verdict from the
 `select()` run that **derived** the price, once.
+
+### Why a model loses: the regret splits in two
+
+`sigma` says which model wins. It does not say *why* a model lost — whether it
+wasted its budget or simply had the wrong budget. Those are different failures
+and they are now reported apart, in nats, as an exact identity rather than a
+weighting.
+
+Write `beta = lambda/alpha` for the declared share and `p(x)` for the share the
+fitted frontier carries at log-budget `x`. At price `lambda` the frontier's own
+optimum sits where `p(x) = beta`, and then **for any candidate, on the curve or
+below it**:
+
+```
+sigma* - sigma_i  =  [ S_f(x_i) - S_i ]  +  KL( beta || p(x_i) )
+                     '--- shortfall --'     '--- displacement ---'
+```
+
+- `shortfall_nats` — nats below the fitted curve **at this model's own budget**:
+  what it wastes. This is the one thing `sigma` cannot see, because `sigma`
+  charges a model for what it *spends*: a model far below the curve can still
+  win on being cheap.
+- `displacement_nats` — `KL(beta || p(x))`, the regret of operating away from
+  where this price is in equilibrium with the frontier. At the canonical
+  `lambda = alpha/2` it is exactly `ln cosh(alpha (x - x*) / 2)`.
+- `regret_nats` — their sum.
+
+Both terms are differences of the **same** scalar `sigma`, so they are the same
+nats by construction and add with weight one: there is no exchange rate left to
+declare between them. And because the sum is `sigma* - sigma_i`, with `sigma*`
+the same for every candidate, these columns **read** the ranking rather than
+altering it. The ranking, the winner, the band and every price are untouched.
+
+Reading the EfficientNet example: `B7` loses 0.43 nats, of which 0.41 is
+displacement — it is not wasteful, it is 37x past where this price pays. `B0`
+loses 0.15 nats, essentially all of it shortfall — it sits furthest below the
+curve.
+
+One resource axis only: with several, each axis is fitted alone and there is no
+single frontier to measure a candidate against; the columns are then absent.
+
+**The missing ceiling.** `eps = eps_inf + c t^-alpha` has a floor but no
+ceiling: pushed far below the budgets it was fitted on it predicts `eps > 1`, an
+error no normalised quality can reach, and a model that "beats" that promise
+collects credit for it. A curve may not promise worse than the trivial bound, so
+the prediction is capped at `eps = 1`. The cap is a fact about the measure, not
+a tuning constant, and it binds only where the law has left the range of
+anything it could describe. Where it binds the regret is larger — the credit is
+withheld — and the identity above is what gives way, not the honest shortfall.
 
 ### Read the verdict before the ranking
 
@@ -356,22 +405,6 @@ jet and the rung are O(n) in the frontier's length and the regret is one
 K-by-grid maximum on the matrix the rank spread already builds, so none of
 them is measurable in the total; on the runs where the jet supplies the price,
 400 bootstrap refits are skipped and the call gets faster.
-
-### Tests
-
-```bash
-python -m unittest discover -s test            # 89 tests, about 40 s
-python -m unittest test.test.TestPublishedCases -v
-```
-
-No dependency beyond `unittest`. `TestPublishedCases` is frozen on the
-examples above: its expected winners are what this implementation and the
-pre-band one both return, so a diff there is a change in the answer users
-see and has to be deliberate. The other groups are ordered by how little
-they assume — input, envelope, price-free, jet, rung, verdict, rate, score,
-band — so a failure localises. `TestOneCharge` guards the API itself: it
-fails if `select()` or `score()` ever computes a ranking without going
-through the shared charging kernel, which is how the two would drift apart.
 
 ### Citation
 

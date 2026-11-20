@@ -276,6 +276,7 @@ __all__ = ["select", "score"]
 MIN_FIT = 3         # 3 parameters need 3 points
 F_TESTABLE = 4      # the nested F-test needs n >= 4
 SPAN_MIN = math.log(1.5)
+LN2 = math.log(2.0)
 LAM_HI = 1e6
 COLS = ("name", "accuracy", "resource")
 MARG_MIN_PTS = MIN_FIT  # 3 parameters need 3 points, no more, no less
@@ -597,6 +598,104 @@ def kl_regret(lam, lam_hat, alpha):
     return p * math.log(p / q) + (1 - p) * math.log((1 - p) / (1 - q))
 
 
+# ------------------------------------------------- the regret at the knee ---
+def frontier_at(fit, x):
+    """The fitted frontier's error at log-budget x, with the ceiling the law
+    is missing.
+
+    eps = eps_inf + c t^-alpha has a floor but no ceiling: driven far below the
+    budgets it was fitted on it predicts eps > 1, an error no normalised
+    quality can reach.  A curve may not promise worse than the trivial bound,
+    so the prediction is capped at 1.  That cap is a fact about the measure,
+    not a tuning constant, and it binds only where the law has been driven
+    outside anything it could describe.  Returns None if the fit cannot be
+    evaluated."""
+    if not fit:
+        return None
+    e_inf, c, al, x0 = (fit.get("eps_inf"), fit.get("c"), fit.get("alpha"),
+                        fit.get("x0"))
+    if e_inf is None or c is None or al is None or x0 is None:
+        return None
+    if not (c > 0 and al > 0):
+        return None
+    with np.errstate(over="ignore"):
+        eps = e_inf + c * np.exp(-al * (np.asarray(x, float) - x0))
+    return np.minimum(eps, 1.0)
+
+
+def knee_regret(df, axis, fit, lam):
+    """Split a candidate's regret against the best operating point in two.
+
+    Write beta = lambda/alpha for the DECLARED share and p(x) for the share the
+    frontier eps = eps_inf + c t^-alpha carries at log-budget x,
+
+        p(x) = 1 / (1 + exp(alpha (x - x*)))  ,   eps_f(x*) = 2 eps_inf .
+
+    At price lambda the frontier's own optimum sits where p(x) = beta, and the
+    loss of operating anywhere else is exactly the regret identity of the
+    reference work, a divergence between two shares:
+
+        sigma(opt) - sigma(x)  =  KL( beta || p(x) )            nats
+
+    (at the canonical lambda = alpha/2 this is ln cosh(alpha (x-x*)/2)).  Hence
+    for ANY candidate, on the frontier or below it,
+
+        sigma* - sigma_i  =  [ S_f(x_i) - S_i ]  +  KL( beta || p(x_i) )
+                             '--- shortfall --'     '--- displacement ---'
+
+    an identity, not a weighting.  Both terms are differences of the SAME
+    scalar sigma, so they are the same nats by construction and add with weight
+    one: there is no exchange rate left to declare between them.  The shortfall
+    is what a candidate fails to deliver at its own budget; the displacement is
+    what its budget costs it for not being the optimum's.  Both are >= 0, and
+    both vanish only at the optimum itself.
+
+    Because the sum is sigma* - sigma_i and sigma* does not depend on the
+    candidate, ordering by the regret is ordering by sigma: these columns READ
+    the ranking, they do not alter it.  The one place the identity gives way is
+    where frontier_at() caps a prediction of eps > 1 -- there the shortfall is
+    measured against the trivial bound instead of against a curve that had left
+    the range of anything it could describe, and the honest shortfall is the
+    one reported.
+
+    Returns (shortfall, displacement, regret), arrays of nats, or three arrays
+    of NaN where there is no optimum to measure against: no floor, no rate, or
+    a price at or above alpha, at which the frontier has no interior optimum.
+    """
+    n = len(df)
+    nan = np.full(n, np.nan)
+    if not fit or (axis not in df and "x__" + axis not in df):
+        return nan, nan, nan
+    al, x0, c, e_inf = (fit.get("alpha"), fit.get("x0"), fit.get("c"),
+                        fit.get("eps_inf"))
+    if al is None or x0 is None or c is None or not e_inf or e_inf <= 0:
+        return nan, nan, nan
+    if not (c > 0 and al > 0) or lam is None:
+        return nan, nan, nan
+    beta = float(lam) / float(al)
+    if not (0.0 < beta < 1.0):          # no interior optimum at this price
+        return nan, nan, nan
+    col = "x__" + axis
+    x = (df[col].to_numpy(float) if col in df
+         else np.log(df[axis].to_numpy(float)))
+    eps = (df["eps"].to_numpy(float) if "eps" in df
+           else 1.0 - df["accuracy"].to_numpy(float))
+    eps_f = frontier_at(fit, x)
+    if eps_f is None:
+        return nan, nan, nan
+    with np.errstate(divide="ignore", invalid="ignore"):
+        short = np.log(eps / eps_f)
+    x_star = x0 + math.log(c / e_inf) / al              # eps_f(x*) = 2 eps_inf
+    v = al * (x - x_star)
+    # p = 1/(1+e^v) and 1-p = 1/(1+e^-v), written through logaddexp so that
+    # neither tail underflows: KL(beta||p) = -H(beta) - b ln p - (1-b) ln(1-p)
+    neg_ln_p = np.logaddexp(0.0, v)
+    neg_ln_1mp = np.logaddexp(0.0, -v)
+    h_beta = -(beta * math.log(beta) + (1 - beta) * math.log1p(-beta))
+    disp = beta * neg_ln_p + (1 - beta) * neg_ln_1mp - h_beta
+    return short, disp, short + disp
+
+
 def sigma_matrix(df, lam_cols, axes=("resource",)):
     """K-by-G matrix of sigma = -ln eps - sum_a lambda_a ln t_a.
     lam_cols is a G-long list of per-axis price dicts (or, for one axis, a
@@ -860,7 +959,16 @@ def axis_price(df, axis, alpha=0.05, boot=400, seed=0, p_floor=0.05,
     F, pval = floor_ftest(rss_s, rss_p, n)
     cv = aicc_k == "with-variance"
     A_s, A_p = _aicc(rss_s, n, 3, cv), _aicc(rss_p, n, 2, cv)
-    t_star = (c_s / e_inf) ** (1 / al) if e_inf > 0 else float("inf")
+    # in logs: (c/eps_inf)^(1/alpha) overflows a float for a small alpha long
+    # before the knee stops being meaningful, and the knee is then simply
+    # beyond any budget -- inf, not an exception
+    if e_inf > 0 and c_s > 0:
+        lt_star = math.log(c_s / e_inf) / al
+        t_star = math.exp(lt_star) if lt_star < 709.0 else float("inf")
+    elif e_inf > 0:
+        t_star = 0.0                      # a flat curve: no knee above zero
+    else:
+        t_star = float("inf")
     spans = bool(t.min() <= t_star <= t.max())
     out.update(eps_inf=e_inf, c=c_s, rss=rss_s, power_c=c_p,
                power_alpha=a_p, power_rss=rss_p,
@@ -869,6 +977,7 @@ def axis_price(df, axis, alpha=0.05, boot=400, seed=0, p_floor=0.05,
                aicc_delta=(None if (A_s is None or A_p is None)
                            else A_p - A_s),
                resolved_nats=float(-ls.min()),
+               x0=float(xs.min()),
                range=[float(t.min()), float(t.max())])
 
     if pval is None:
@@ -1290,6 +1399,7 @@ def select(df, alpha=0.05, boot=400, seed=0, aicc_k="with-variance",
                       "aicc_convention": aicc_k, "knee": p0["knee"],
                       "knee_spanned": p0["knee_spanned"],
                       "resolved_nats": p0.get("resolved_nats"),
+                      "x0": p0.get("x0"),
                       "range": p0.get("range")}
 
     lam = {a: priced[a]["lambda"] for a in priced}
@@ -1481,6 +1591,18 @@ def select(df, alpha=0.05, boot=400, seed=0, aicc_k="with-variance",
         res["ranking"] = rank_frame(cands, res, lam, corners, axes,
                                     regret=res["minimax"]["regret"],
                                     band=res["band"]["members"])
+        # The exact split of each candidate's regret against the knee.  It is a
+        # reading of the same sigma the ranking already uses, so the order is
+        # untouched; what it adds is WHERE a candidate loses -- what it fails
+        # to deliver at its own budget, against what its budget costs it.  One
+        # resource axis only: with several, each axis is fitted alone and there
+        # is no single frontier to measure a candidate against.
+        if not multi:
+            sh, dp, rg = knee_regret(res["ranking"], axes[0],
+                                     res.get("fit"), lam.get(axes[0]))
+            res["ranking"]["shortfall_nats"] = sh
+            res["ranking"]["displacement_nats"] = dp
+            res["ranking"]["regret_nats"] = rg
     if not multi and (p0["eps_inf"] or 0) > 0 and p0["knee"]:
         gap = float(np.min(np.abs(front["x__" + axes[0]].to_numpy()
                                   - math.log(p0["knee"]))))
@@ -1800,6 +1922,42 @@ def render(r, color=True):
         for nm, sg in zip(r["scores"]["name"], r["scores"]["sigma"]):
             L.append(f"  {nm:<20} {sg:+.4f}"
                      + ("   <= winner" if nm == w["name"] else ""))
+
+    rk_ = r.get("ranking")
+    if (rk_ is not None and "regret_nats" in rk_
+            and np.isfinite(rk_["regret_nats"].to_numpy(float)).any()):
+        L += ["", "REGRET ......... sigma* - sigma, split exactly into what a "
+                  "model fails to deliver",
+              "                 at its own budget and what its budget costs "
+              "it  [nats]",
+              "    # name                 shortfall  displace    regret"]
+        for i in range(len(rk_)):
+            row = rk_.iloc[i]
+            if not np.isfinite(row["regret_nats"]):
+                continue
+            L.append(f"  {i + 1:3d} {str(row['name']):<20} "
+                     f"{row['shortfall_nats']:+9.4f} {row['displacement_nats']:+9.4f}"
+                     f" {row['regret_nats']:+9.4f}"
+                     + ("   <= winner" if row["name"] == w["name"] else ""))
+        L += ["  shortfall .... nats below the fitted curve AT THIS MODEL'S "
+              "OWN budget: what it",
+              "                 wastes.  The curve may not promise worse than "
+              "the trivial bound,",
+              "                 so a prediction of eps > 1 is capped there.",
+              "  displace ..... KL(lambda/alpha || share at this budget): "
+              "the regret of operating",
+              "                 away from where this price is in equilibrium "
+              "with the frontier.",
+              "  regret ....... their sum.  Wherever the curve stays inside "
+              "the trivial bound it",
+              "                 is sigma* - sigma exactly, so it READS the "
+              "ranking above rather",
+              "                 than altering it, and the two parts say WHY. "
+              " Where the cap binds",
+              "                 it is larger: the credit for beating an "
+              "impossible promise is",
+              "                 withheld.  The ranking itself is never "
+              "touched."]
 
     bd, mx = r.get("band"), r.get("minimax")
     if bd and mx:

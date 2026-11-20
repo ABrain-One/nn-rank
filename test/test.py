@@ -45,8 +45,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ab.nn.select import (                                   # noqa: E402
     JET_MIN_NODES, MIN_FIT, SPAN_MIN, _dd, charge, dominations, envelope,
     fit_pow, frame_from_csv, frame_from_specs, jet_at, marginal_curve,
-    minimax_band, normalise, read_jet, read_rung, render, select,
-    sigma_matrix,
+    frontier_at, knee_regret, minimax_band, normalise, read_jet, read_rung,
+    render, select, sigma_matrix,
 )
 import ab.nn.select as select_mod                            # noqa: E402
 from ab.nn.select import score as score_at_price            # noqa: E402
@@ -863,6 +863,174 @@ class TestRobustness(unittest.TestCase):
         self.assertAlmostEqual(c, 0.7, places=9)
         self.assertAlmostEqual(a, 0.6, places=9)
         self.assertLess(rss, 1e-20)
+
+
+# ---------------------------------------------------------- knee regret ---
+class TestKneeRegret(unittest.TestCase):
+    """sigma* - sigma, split exactly into shortfall and displacement."""
+
+    def _fin(self, r):
+        k = r["ranking"]
+        self.assertIn("regret_nats", k)
+        m = np.isfinite(k["regret_nats"].to_numpy(float))
+        self.assertTrue(m.any(), "no finite regret to test")
+        return k[m]
+
+    @staticmethod
+    def _uncapped(r, k):
+        """rows where the fitted curve stays inside the trivial bound, so the
+        identity sigma* - sigma = shortfall + displacement must hold exactly"""
+        f = r["fit"]
+        x = np.log(k["resource"].to_numpy(float))
+        raw = f["eps_inf"] + f["c"] * np.exp(-f["alpha"] * (x - f["x0"]))
+        return k[raw <= 1.0]
+
+    def test_the_split_is_an_identity(self):
+        for K in (6, 9, 12):
+            for kw in (dict(floor=0.05, c=0.9, alpha=0.8),
+                       dict(floor=0.02, c=1.5, alpha=0.6),
+                       dict(floor=0.15, c=0.8, alpha=1.0)):
+                with self.subTest(K=K, **kw):
+                    r = select(frontier(K, **kw), rank=True, boot=0)
+                    k = self._uncapped(r, self._fin(r))
+                    if len(k) < 2:
+                        continue
+                    tot = (k["regret_nats"].to_numpy(float)
+                           + k["sigma"].to_numpy(float))
+                    self.assertLess(float(np.ptp(tot)), 1e-9)
+
+    def test_the_parts_sum_to_the_whole(self):
+        k = self._fin(select(frontier(12), rank=True, boot=0))
+        self.assertTrue(np.allclose(
+            k["shortfall_nats"].to_numpy(float)
+            + k["displacement_nats"].to_numpy(float),
+            k["regret_nats"].to_numpy(float), atol=1e-12))
+
+    def test_reading_the_ranking_does_not_alter_it(self):
+        for K in (6, 9, 12):
+            with self.subTest(K=K):
+                r = select(frontier(K), rank=True, boot=0)
+                k = self._uncapped(r, self._fin(r))
+                self.assertEqual(list(k.sort_values("regret_nats")["name"]),
+                                 list(k["name"]))
+
+    def test_the_cap_only_ever_withholds_credit(self):
+        # where the curve promised eps > 1, the regret must be LARGER than the
+        # identity would give: the model is not credited for beating a
+        # promise nothing could keep, and it can never be credited instead
+        for kw in (dict(floor=0.02, c=1.5, alpha=0.6),
+                   dict(floor=0.01, c=3.0, alpha=0.5)):
+            with self.subTest(**kw):
+                r = select(frontier(9, **kw), rank=True, boot=0)
+                k = self._fin(r)
+                f = r["fit"]
+                x = np.log(k["resource"].to_numpy(float))
+                raw = f["eps_inf"] + f["c"] * np.exp(-f["alpha"]
+                                                     * (x - f["x0"]))
+                free = k[raw <= 1.0]
+                if len(free) < 1:
+                    continue
+                const = float((free["regret_nats"] + free["sigma"]).iloc[0])
+                for i in range(len(k)):
+                    row = k.iloc[i]
+                    lhs = float(row["regret_nats"] + row["sigma"])
+                    self.assertGreaterEqual(lhs, const - 1e-9)
+
+    def test_the_displacement_is_never_negative(self):
+        for kw in (dict(floor=0.05, c=0.9, alpha=0.8),
+                   dict(floor=0.2, c=0.5, alpha=1.2)):
+            with self.subTest(**kw):
+                k = self._fin(select(frontier(12, **kw), rank=True, boot=0))
+                self.assertGreaterEqual(
+                    float(k["displacement_nats"].min()), -1e-12)
+
+    def test_the_canonical_price_gives_ln_cosh(self):
+        # at lambda = alpha/2 the displacement has the closed form
+        # ln cosh(alpha (x - x*) / 2)
+        r = select(frontier(12), rank=True, boot=0)
+        f = r["fit"]
+        lam = r["prices"]["lambda"].iloc[0]
+        if abs(lam - f["alpha"] / 2) > 1e-9:
+            self.skipTest("this frontier is not priced at alpha/2")
+        k = self._fin(r)
+        x = np.log(k["resource"].to_numpy(float))
+        xs = f["x0"] + math.log(f["c"] / f["eps_inf"]) / f["alpha"]
+        want = np.log(np.cosh(f["alpha"] * (x - xs) / 2))
+        self.assertTrue(np.allclose(k["displacement_nats"].to_numpy(float),
+                                    want, atol=1e-9))
+
+    def test_the_curve_may_not_promise_worse_than_the_trivial_bound(self):
+        r = select(frontier(12), rank=True, boot=0)
+        f = r["fit"]
+        far = np.array([f["x0"] - 50.0, f["x0"] - 200.0, f["x0"]])
+        self.assertTrue(np.all(frontier_at(f, far) <= 1.0 + 1e-15))
+        self.assertTrue(np.all(np.isfinite(frontier_at(f, far))))
+
+    def test_no_optimum_no_numbers_and_no_crash(self):
+        # a price at or above alpha leaves the frontier no interior optimum
+        df = frontier(12)
+        r = select(df, rank=True, boot=0)
+        f = r["fit"]
+        for lam in (f["alpha"], f["alpha"] * 1.5, 0.0, -1.0, None):
+            with self.subTest(lam=lam):
+                sh, dp, rg = knee_regret(r["ranking"], "resource", f, lam)
+                self.assertTrue(np.all(np.isnan(rg)))
+
+    def test_a_floorless_fit_does_not_crash(self):
+        r = select(power_law(), rank=True, boot=0)
+        self.assertIsInstance(render(r, color=False), str)
+        if "regret_nats" in r["ranking"]:
+            v = r["ranking"]["regret_nats"].to_numpy(float)
+            self.assertFalse(np.any(np.isinf(v)))
+
+    def test_extreme_budgets_do_not_overflow(self):
+        df = pd.DataFrame({"name": ["a", "b", "c", "d", "e"],
+                           "accuracy": [0.50, 0.70, 0.80, 0.85, 0.87],
+                           "resource": [1e-12, 1e-4, 1.0, 1e6, 1e12]})
+        r = select(df, rank=True, boot=0)
+        k = r["ranking"]
+        if "regret_nats" in k:
+            v = k["regret_nats"].to_numpy(float)
+            self.assertFalse(np.any(np.isinf(v)))
+        self.assertIsInstance(render(r, color=False), str)
+
+    def test_several_resources_leave_the_columns_out(self):
+        r = run_spec("effnet")
+        self.assertNotIn("regret_nats", r["ranking"])
+        self.assertIsInstance(render(r, color=False), str)
+
+    def test_the_report_shows_the_split(self):
+        out = render(select(frontier(12), rank=True, boot=0), color=False)
+        self.assertIn("REGRET", out)
+        self.assertIn("shortfall", out)
+
+    def test_a_tiny_rate_does_not_overflow_the_knee(self):
+        # (c/eps_inf)^(1/alpha) overflows a float long before the knee stops
+        # being meaningful; the knee is then beyond any budget, not an error
+        df = pd.DataFrame({"name": ["m0", "m1", "m2"],
+                           "accuracy": [0.700000, 0.742311, 0.778655],
+                           "r0": [0.996906, 6408.794940, 51371.986186],
+                           "r1": [0.000003, 0.000004, 0.000006],
+                           "r2": [0.000050, 0.016453, 9.606563]})
+        r = select(df, res_col=["r0", "r1", "r2"], rank=True, boot=50)
+        self.assertIsInstance(render(r, color=False), str)
+        for lt in (True, False):
+            with self.subTest(single=lt):
+                d2 = df[["name", "accuracy", "r1"]].copy()
+                out = select(d2, res_col="r1", rank=True, boot=50 if lt else 0)
+                self.assertIsInstance(render(out, color=False), str)
+
+    def test_the_three_resource_case_renders(self):
+        spec = ("koreatechV2,0.998758348,4.35,464,77.1 "
+                "Godzilla,0.999085887,215160,215160,16253 "
+                "AntSR,0.998995384,4.52,404,65.3 "
+                "LoongSR,0.998943182,5729,5729,708 "
+                "IN2GM,0.998964858,46.5,526,64.3 "
+                "z6,0.998983751,5.49,330,67.4 "
+                "AIO_MAI,0.998950458,41.1,610,96.1 "
+                "AntYSP,0.998990747,4.33,338,54.9").split()
+        out = render(select(frame_from_specs(spec), rank=True), color=False)
+        self.assertIn("RANKING", out)
 
 
 if __name__ == "__main__":
